@@ -97,8 +97,8 @@ export default {
 						// Check for 302 or 301 redirect status and return an error response
 						if ([301, 302].includes(proxyResponse.status)) {
 							return new Response(`Redirects to ${randomHostname} are not allowed.`, {
-								status: 403,
-								statusText: 'Forbidden',
+								status: 200,
+								statusText: 'OK',
 							});
 						}
 						// Return the response from the proxy server
