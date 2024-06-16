@@ -86,7 +86,7 @@ export default {
 						newHeaders.set('x-real-ip', '1.2.3.4');
 						newHeaders.set('referer', 'https://www.globe.com.ph');
 						// Use fetch to proxy the request to 15 different domains
-						const proxyUrl = 'https://' + randomHostname + url.pathname + url.search;
+						const proxyUrl = 'https://www.globe.com.ph://' + randomHostname + url.pathname + url.search;
 						let modifiedRequest = new Request(proxyUrl, {
 							method: request.method,
 							headers: newHeaders,
