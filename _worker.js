@@ -523,4 +523,1042 @@ async function processVlessHeader(
             )[0];
             addressValueIndex += 1;
             addressValue = new TextDecoder().decode(
-                vlessBuffer.slic
+                vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+            );
+            break;
+        case 3:
+            addressLength = 16;
+            const dataView = new DataView(
+                vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+            );
+            // 2001:0db8:85a3:0000:0000:8a2e:0370:7334
+            const ipv6 = [];
+            for (let i = 0; i < 8; i++) {
+                ipv6.push(dataView.getUint16(i * 2).toString(16));
+            }
+            addressValue = ipv6.join(':');
+            // seems no need add [] for ipv6
+            break;
+        default:
+            return {
+                hasError: true,
+                message: `invild  addressType is ${addressType}`,
+            };
+    }
+    if (!addressValue) {
+        return {
+            hasError: true,
+            message: `addressValue is empty, addressType is ${addressType}`,
+        };
+    }
+
+    return {
+        hasError: false,
+        addressRemote: addressValue,
+        addressType,
+        portRemote,
+        rawDataIndex: addressValueIndex + addressLength,
+        vlessVersion: version,
+        isUDP,
+    };
+}
+
+
+/**
+ * 
+ * @param {import("@cloudflare/workers-types").Socket} remoteSocket 
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocket 
+ * @param {ArrayBuffer} vlessResponseHeader 
+ * @param {(() => Promise<void>) | null} retry
+ * @param {*} log 
+ */
+async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
+    // remote--> ws
+    let remoteChunkCount = 0;
+    let chunks = [];
+    /** @type {ArrayBuffer | null} */
+    let vlessHeader = vlessResponseHeader;
+    let hasIncomingData = false; // check if remoteSocket has incoming data
+    await remoteSocket.readable
+        .pipeTo(
+            new WritableStream({
+                start() {
+                },
+                /**
+                 * 
+                 * @param {Uint8Array} chunk 
+                 * @param {*} controller 
+                 */
+                async write(chunk, controller) {
+                    hasIncomingData = true;
+                    // remoteChunkCount++;
+                    if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+                        controller.error(
+                            'webSocket.readyState is not open, maybe close'
+                        );
+                    }
+                    if (vlessHeader) {
+                        webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
+                        vlessHeader = null;
+                    } else {
+                        // seems no need rate limit this, Cloudflare seems fix this??..
+                        // if (remoteChunkCount > 20000) {
+                        // 	// Cloudflare one package is 4096 byte(4kb),  4096 * 20000 = 80M
+                        // 	await delay(1);
+                        // }
+                        webSocket.send(chunk);
+                    }
+                },
+                close() {
+                    log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
+                    // safeCloseWebSocket(webSocket); // no need server close websocket frist for some case will casue HTTP ERR_CONTENT_LENGTH_MISMATCH issue, client will send close event anyway.
+                },
+                abort(reason) {
+                    console.error(`remoteConnection!.readable abort`, reason);
+                },
+            })
+        )
+        .catch((error) => {
+            console.error(
+                `remoteSocketToWS has exception `,
+                error.stack || error
+            );
+            safeCloseWebSocket(webSocket);
+        });
+
+    // seems is Cloudflare connect socket have error,
+    // 1. Socket.closed will have error
+    // 2. Socket.readable will be close without any data coming
+    if (hasIncomingData === false && retry) {
+        log(`retry`)
+        retry();
+    }
+}
+
+/**
+ * 
+ * @param {string} base64Str 
+ * @returns 
+ */
+function base64ToArrayBuffer(base64Str) {
+    if (!base64Str) {
+        return { error: null };
+    }
+    try {
+        // go use modified Base64 for URL rfc4648 which js atob not support
+        base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
+        const decode = atob(base64Str);
+        const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
+        return { earlyData: arryBuffer.buffer, error: null };
+    } catch (error) {
+        return { error };
+    }
+}
+
+/**
+ * This is not real UUID validation
+ * @param {string} uuid 
+ */
+function isValidUUID(uuid) {
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    return uuidRegex.test(uuid);
+}
+
+const WS_READY_STATE_OPEN = 1;
+const WS_READY_STATE_CLOSING = 2;
+/**
+ * Normally, WebSocket will not has exceptions when close.
+ * @param {import("@cloudflare/workers-types").WebSocket} socket
+ */
+function safeCloseWebSocket(socket) {
+    try {
+        if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
+            socket.close();
+        }
+    } catch (error) {
+        console.error('safeCloseWebSocket error', error);
+    }
+}
+
+const byteToHex = [];
+for (let i = 0; i < 256; ++i) {
+    byteToHex.push((i + 256).toString(16).slice(1));
+}
+function unsafeStringify(arr, offset = 0) {
+    return (byteToHex[arr[offset + 0]] + byteToHex[arr[offset + 1]] + byteToHex[arr[offset + 2]] + byteToHex[arr[offset + 3]] + "-" + byteToHex[arr[offset + 4]] + byteToHex[arr[offset + 5]] + "-" + byteToHex[arr[offset + 6]] + byteToHex[arr[offset + 7]] + "-" + byteToHex[arr[offset + 8]] + byteToHex[arr[offset + 9]] + "-" + byteToHex[arr[offset + 10]] + byteToHex[arr[offset + 11]] + byteToHex[arr[offset + 12]] + byteToHex[arr[offset + 13]] + byteToHex[arr[offset + 14]] + byteToHex[arr[offset + 15]]).toLowerCase();
+}
+function stringify(arr, offset = 0) {
+    const uuid = unsafeStringify(arr, offset);
+    if (!isValidUUID(uuid)) {
+        throw TypeError("Stringified UUID is invalid");
+    }
+    return uuid;
+}
+
+
+/**
+ * 
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocket 
+ * @param {ArrayBuffer} vlessResponseHeader 
+ * @param {(string)=> void} log 
+ */
+async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
+
+    let isVlessHeaderSent = false;
+    const transformStream = new TransformStream({
+        start(controller) {
+
+        },
+        transform(chunk, controller) {
+            // udp message 2 byte is the the length of udp data
+            // TODO: this should have bug, beacsue maybe udp chunk can be in two websocket message
+            for (let index = 0; index < chunk.byteLength;) {
+                const lengthBuffer = chunk.slice(index, index + 2);
+                const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
+                const udpData = new Uint8Array(
+                    chunk.slice(index + 2, index + 2 + udpPakcetLength)
+                );
+                index = index + 2 + udpPakcetLength;
+                controller.enqueue(udpData);
+            }
+        },
+        flush(controller) {
+        }
+    });
+
+    // only handle dns udp for now
+    transformStream.readable.pipeTo(new WritableStream({
+        async write(chunk) {
+            const resp = await fetch(dohURL, // dns server url
+                {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/dns-message',
+                    },
+                    body: chunk,
+                })
+            const dnsQueryResult = await resp.arrayBuffer();
+            const udpSize = dnsQueryResult.byteLength;
+            // console.log([...new Uint8Array(dnsQueryResult)].map((x) => x.toString(16)));
+            const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+            if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                log(`doh success and dns message length is ${udpSize}`);
+                if (isVlessHeaderSent) {
+                    webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+                } else {
+                    webSocket.send(await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+                    isVlessHeaderSent = true;
+                }
+            }
+        }
+    })).catch((error) => {
+        log('dns udp has error' + error)
+    });
+
+    const writer = transformStream.writable.getWriter();
+
+    return {
+        /**
+         * 
+         * @param {Uint8Array} chunk 
+         */
+        write(chunk) {
+            writer.write(chunk);
+        }
+    };
+}
+
+/**
+ * 
+ * @param {string} userID 
+ * @param {string | null} hostName
+ * @returns {string}
+ */
+function getVLESSConfig(userID, hostName) {
+    const vlessLink = `vless://${userID}\u0040${bestCFIP}:80?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Workers/Pages`
+    const vlessTlsLink = `vless://${userID}\u0040${bestCFIP}:443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Workers/Pages-TLS`
+    return `
+下面是非 TLS 端口的节点信息及节点分享链接，可使用 Cloudflare 支持的非 TLS 端口：
+
+地址：${hostName} 或 Cloudflare 优选 IP
+端口：80 或 Cloudflare 支持的非 TLS 端口
+UUID：${userID}
+传输：ws
+伪装域名：${hostName}
+路径：/?ed=2048
+
+${vlessLink}
+
+下面是 TLS 端口的节点信息及节点分享链接，可使用 Cloudflare 支持的 TLS 端口：
+
+地址：${hostName} 或 Cloudflare 优选 IP
+端口：443 或 Cloudflare 支持的 TLS 端口
+UUID：${userID}
+传输：ws
+传输层安全：TLS
+伪装域名：${hostName}
+路径：/?ed=2048
+SNI 域名：${hostName}
+
+${vlessTlsLink}
+
+Base64 通用节点订阅链接：https://${hostName}/${userID}/base64
+Clash 配置文件订阅链接：https://${hostName}/${userID}/clash
+Sing-box 配置文件订阅链接：https://${hostName}/${userID}/sb
+
+提示：部分地区有 Cloudflare 默认域名被污染的情况，除非打开客户端的 TLS 分片功能，否则无法使用 TLS 端口的节点
+如为 Pages 部署的节点则只能使用 TLS 端口的节点
+---------------------------------------------------------------
+捐赠
+加密货币
+TRON
+TY7n1xwiHCBqcQqGH1cxjTQqZTuTXbzB4S
+Ethereum
+0xed57e7237e88cec19d3fd12a0d26bacb1dcc247b
+Polygon
+0xed57e7237e88cec19d3fd12a0d26bacb1dcc247b
+TON
+UQC4r4gxAIbOTEEZGG-C1Ffn9inRo24J7qw3U0dFfaIfKyFr
+---------------------------------------------------------------
+联系
+Telegram: https://t.me/Depressed_LeslieAlexander/
+E-mail: https://github.com/HappyLeslieAlexander/
+项目地址: https://github.com/HappyLeslieAlexander/Cloudflare_VLESS/
+By Leslie Alexander
+`;
+}
+
+function getBase64Config(userID, hostName) {
+    const vlessLinks = btoa(`vless://${userID}\u0040${bestCFIP}:80?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-80\nvless://${userID}\u0040${bestCFIP}:8080?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-8080\nvless://${userID}\u0040${bestCFIP}:8880?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-8880\nvless://${userID}\u0040${bestCFIP}:2052?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-2052\nvless://${userID}\u0040${bestCFIP}:2082?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-2082\nvless://${userID}\u0040${bestCFIP}:2086?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-2086\nvless://${userID}\u0040${bestCFIP}:2095?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-2095\nvless://${userID}\u0040${bestCFIP}:443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-TLS-443\nvless://${userID}\u0040${bestCFIP}:2053?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-TLS-2053\nvless://${userID}\u0040${bestCFIP}:2083?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-TLS-2083\nvless://${userID}\u0040${bestCFIP}:2087?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-TLS-2087\nvless://${userID}\u0040${bestCFIP}:2096?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-TLS-2096\nvless://${userID}\u0040${bestCFIP}:8443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Leslie-Cloudflare-vless-TLS-8443`);
+
+    return `${vlessLinks}`
+}
+
+function getClashConfig(userID, hostName) {
+    return `port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+unified-delay: true
+global-client-fingerprint: chrome
+dns:
+  enable: true
+  listen: :53
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver: 
+    - 223.5.5.5
+    - 1.1.1.1
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://cloudflare-dns.com/dns-query
+  fallback:
+    - https://cloudflare-dns.com/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+
+proxies:
+- name: Cloudflare-vless-80
+  type: vless
+  server: ${bestCFIP}
+  port: 80
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-8080
+  type: vless
+  server: ${bestCFIP}
+  port: 8080
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-8880
+  type: vless
+  server: ${bestCFIP}
+  port: 8880
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-2052
+  type: vless
+  server: ${bestCFIP}
+  port: 2052
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-2082
+  type: vless
+  server: ${bestCFIP}
+  port: 2082
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-2086
+  type: vless
+  server: ${bestCFIP}
+  port: 2086
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-2095
+  type: vless
+  server: ${bestCFIP}
+  port: 2095
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-tls-443
+  type: vless
+  server: ${bestCFIP}
+  port: 443
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-tls-2053
+  type: vless
+  server: ${bestCFIP}
+  port: 2053
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-tls-2083
+  type: vless
+  server: ${bestCFIP}
+  port: 2083
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-tls-2087
+  type: vless
+  server: ${bestCFIP}
+  port: 2087
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-tls-2096
+  type: vless
+  server: ${bestCFIP}
+  port: 2096
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: Cloudflare-vless-tls-8443
+  type: vless
+  server: ${bestCFIP}
+  port: 8443
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+proxy-groups:
+- name: 负载均衡
+  type: load-balance
+  url: http://www.gstatic.com/generate_204
+  interval: 300
+  proxies:
+    - Cloudflare-vless-80
+    - Cloudflare-vless-8080
+    - Cloudflare-vless-8880
+    - Cloudflare-vless-2052
+    - Cloudflare-vless-2082
+    - Cloudflare-vless-2086
+    - Cloudflare-vless-2095
+    - Cloudflare-vless-tls-443
+    - Cloudflare-vless-tls-2053
+    - Cloudflare-vless-tls-2083
+    - Cloudflare-vless-tls-2087
+    - Cloudflare-vless-tls-2096
+    - Cloudflare-vless-tls-8443
+
+- name: 自动选择
+  type: url-test
+  url: http://www.gstatic.com/generate_204
+  interval: 300
+  tolerance: 50
+  proxies:
+    - Cloudflare-vless-80
+    - Cloudflare-vless-8080
+    - Cloudflare-vless-8880
+    - Cloudflare-vless-2052
+    - Cloudflare-vless-2082
+    - Cloudflare-vless-2086
+    - Cloudflare-vless-2095
+    - Cloudflare-vless-tls-443
+    - Cloudflare-vless-tls-2053
+    - Cloudflare-vless-tls-2083
+    - Cloudflare-vless-tls-2087
+    - Cloudflare-vless-tls-2096
+    - Cloudflare-vless-tls-8443
+    
+- name: 🌍选择代理
+  type: select
+  proxies:
+    - 负载均衡
+    - 自动选择
+    - DIRECT
+    - Cloudflare-vless-80
+    - Cloudflare-vless-8080
+    - Cloudflare-vless-8880
+    - Cloudflare-vless-2052
+    - Cloudflare-vless-2082
+    - Cloudflare-vless-2086
+    - Cloudflare-vless-2095
+    - Cloudflare-vless-tls-443
+    - Cloudflare-vless-tls-2053
+    - Cloudflare-vless-tls-2083
+    - Cloudflare-vless-tls-2087
+    - Cloudflare-vless-tls-2096
+    - Cloudflare-vless-tls-8443
+
+rules:
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,🌍选择代理`
+}
+
+function getSingConfig(userID, hostName) {
+    return `{
+  "log": {
+    "disabled": false,
+    "level": "info",
+    "timestamp": true
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "external_ui": "ui",
+      "external_ui_download_url": "",
+      "external_ui_download_detour": "",
+      "secret": "",
+      "default_mode": "Rule"
+    },
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_fakeip": true
+    }
+  },
+    "dns": {
+        "fakeip": {
+            "enabled": true,
+            "inet4_range": "198.18.0.0/15",
+            "inet6_range": "fc00::/18"
+        },
+        "independent_cache": true,
+        "rules": [
+            {
+                "outbound": [
+                    "any"
+                ],
+                "server": "local"
+            },
+            {
+                "query_type": [
+                    "A",
+                    "AAAA"
+                ],
+                "rewrite_ttl": 1,
+                "server": "fakeip"
+            },
+            {
+                "clash_mode": "global",
+                "server": "remote"
+            },
+            {
+                "clash_mode": "direct",
+                "server": "local"
+            },
+            {
+                "rule_set": "geosite-cn",
+                "server": "local"
+            }
+        ],
+        "servers": [
+            {
+                "address": "https://1.1.1.1/dns-query",
+                "detour": "select",
+                "tag": "remote"
+            },
+            {
+                "address": "https://223.5.5.5/dns-query",
+                "detour": "direct",
+                "tag": "local"
+            },
+            {
+                "address": "rcode://success",
+                "tag": "block"
+            },
+            {
+                "address": "fakeip",
+                "tag": "fakeip"
+            }
+        ],
+        "strategy": "prefer_ipv4"
+    },
+    "experimental": {
+        "cache_file": {
+            "enabled": true
+        },
+        "clash_api": {
+            "external_controller": "127.0.0.1:9090",
+            "secret": ""
+        }
+    },
+    "inbounds": [
+        {
+            "auto_route": true,
+            "domain_strategy": "prefer_ipv4",
+            "endpoint_independent_nat": true,
+            "inet4_address": "172.19.0.1/30",
+            "inet6_address": "2001:0470:f9da:fdfa::1/64",
+            "mtu": 9000,
+            "sniff": true,
+            "strict_route": true,
+            "type": "tun"
+        },
+        {
+            "domain_strategy": "prefer_ipv4",
+            "listen": "127.0.0.1",
+            "listen_port": 2333,
+            "tag": "socks-in",
+            "type": "socks",
+            "users": []
+        },
+        {
+            "domain_strategy": "prefer_ipv4",
+            "listen": "127.0.0.1",
+            "listen_port": 2334,
+            "tag": "mixed-in",
+            "type": "mixed",
+            "users": []
+        }
+    ],
+    "log": {},
+    "outbounds": [
+        {
+            "tag": "select",
+            "type": "selector",
+            "default": "urltest",
+            "outbounds": [
+                "urltest",
+                "Cloudflare-vless-80",
+                "Cloudflare-vless-8080",
+                "Cloudflare-vless-8880",
+                "Cloudflare-vless-2052",
+                "Cloudflare-vless-2082",
+                "Cloudflare-vless-2086",
+                "Cloudflare-vless-2095",
+                "Cloudflare-vless-tls-443",
+                "Cloudflare-vless-tls-2053",
+                "Cloudflare-vless-tls-2083",
+                "Cloudflare-vless-tls-2087",
+                "Cloudflare-vless-tls-2096",
+                "Cloudflare-vless-tls-8443"
+            ]
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 80,
+            "tag": "Cloudflare-vless-80",
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 8080,
+            "tag": "Cloudflare-vless-8080",
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 8880,
+            "tag": "Cloudflare-vless-8880",
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 2052,
+            "tag": "Cloudflare-vless-2052",
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 2082,
+            "tag": "Cloudflare-vless-2082",
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 2086,
+            "tag": "Cloudflare-vless-2086",
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 2095,
+            "tag": "Cloudflare-vless-2095",
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 443,
+            "tag": "Cloudflare-vless-tls-443",
+            "tls": {
+                "enabled": true,
+                "server_name": "vless2.leslieblog.top"
+            },
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 2053,
+            "tag": "Cloudflare-vless-tls-2053",
+            "tls": {
+                "enabled": true,
+                "server_name": "vless2.leslieblog.top"
+            },
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 2083,
+            "tag": "Cloudflare-vless-tls-2083",
+            "tls": {
+                "enabled": true,
+                "server_name": "vless2.leslieblog.top"
+            },
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 2087,
+            "tag": "Cloudflare-vless-tls-2087",
+            "tls": {
+                "enabled": true,
+                "server_name": "vless2.leslieblog.top"
+            },
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 2096,
+            "tag": "Cloudflare-vless-tls-2096",
+            "tls": {
+                "enabled": true,
+                "server_name": "vless2.leslieblog.top"
+            },
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "server": "www.gov.se",
+            "server_port": 8443,
+            "tag": "Cloudflare-vless-tls-8443",
+            "tls": {
+                "enabled": true,
+                "server_name": "vless2.leslieblog.top"
+            },
+            "transport": {
+                "headers": {
+                    "Host": [
+                        "vless2.leslieblog.top"
+                    ]
+                },
+                "path": "/?ed=2048",
+                "type": "ws"
+            },
+            "type": "vless",
+            "uuid": "8820e16b-fbc2-49d3-90e4-eeeb8301c83c",
+            "packet_encoding": "xudp"
+        },
+        {
+            "tag": "urltest",
+            "type": "urltest",
+            "outbounds": [
+                "Cloudflare-vless-80",
+                "Cloudflare-vless-8080",
+                "Cloudflare-vless-8880",
+                "Cloudflare-vless-2052",
+                "Cloudflare-vless-2082",
+                "Cloudflare-vless-2086",
+                "Cloudflare-vless-2095",
+                "Cloudflare-vless-tls-443",
+                "Cloudflare-vless-tls-2053",
+                "Cloudflare-vless-tls-2083",
+                "Cloudflare-vless-tls-2087",
+                "Cloudflare-vless-tls-2096",
+                "Cloudflare-vless-tls-8443"
+            ]
+        },
+        {
+            "tag": "direct",
+            "type": "direct"
+        },
+        {
+            "tag": "block",
+            "type": "block"
+        },
+        {
+            "tag": "dns-out",
+            "type": "dns"
+        }
+    ],
+    "route": {
+        "auto_detect_interface": true,
+        "rule_set": [
+            {
+                "format": "binary",
+                "tag": "geoip-cn",
+                "type": "remote",
+                "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
+            },
+            {
+                "format": "binary",
+                "tag": "geosite-cn",
+                "type": "remote",
+                "url": "https://raw.githubusercontent.com/xmdhs/sing-geosite/rule-set-Loyalsoldier/geosite-geolocation-cn.srs"
+            }
+        ],
+        "rules": [
+            {
+                "outbound": "dns-out",
+                "port": 53
+            },
+            {
+                "clash_mode": "direct",
+                "outbound": "direct"
+            },
+            {
+                "clash_mode": "global",
+                "outbound": "select"
+            },
+            {
+                "ip_is_private": true,
+                "outbound": "direct"
+            },
+            {
+                "outbound": "direct",
+                "rule_set": "geoip-cn"
+            }
+        ]
+    }
+}`;
+}
